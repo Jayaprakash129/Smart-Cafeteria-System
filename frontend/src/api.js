@@ -1,5 +1,6 @@
 const TOKEN_KEY = "sc_token";
 const USER_KEY = "sc_user";
+const INSTITUTION_KEY = "sc_admin_institution";
 
 export const getToken = () => localStorage.getItem(TOKEN_KEY);
 export const getUser = () => {
@@ -20,28 +21,105 @@ export function clearSession() {
   localStorage.removeItem(USER_KEY);
 }
 
-async function request(path, { method = "GET", body } = {}) {
+// A super_admin isn't pinned to one institution, so the Kitchen-role pages
+// (which never pass institution_id themselves) have nothing to scope to and
+// previously 400'd with "super_admin must specify institution_id" the
+// moment a super_admin opened "Kitchen View". getSelectedInstitution /
+// setSelectedInstitution back an explicit picker (see Layout.jsx); when
+// nothing has been picked yet, ensureInstitutionId() below falls back to
+// the first active institution automatically.
+export const getSelectedInstitution = () => {
+  const v = localStorage.getItem(INSTITUTION_KEY);
+  return v ? Number(v) : null;
+};
+export const setSelectedInstitution = (id) => {
+  if (id == null) localStorage.removeItem(INSTITUTION_KEY);
+  else localStorage.setItem(INSTITUTION_KEY, String(id));
+};
+
+let defaultInstitutionPromise = null;
+async function ensureInstitutionId() {
+  const existing = getSelectedInstitution();
+  if (existing != null) return existing;
+  if (!defaultInstitutionPromise) {
+    defaultInstitutionPromise = rawRequest("/admin/institutions")
+      .then((rows) => {
+        const first = (rows || []).find((r) => r.active) || rows?.[0];
+        if (first) setSelectedInstitution(first.id);
+        return first?.id ?? null;
+      })
+      .catch(() => null);
+  }
+  return defaultInstitutionPromise;
+}
+
+function appendQueryParam(path, key, value) {
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}${key}=${encodeURIComponent(value)}`;
+}
+
+// Raw fetch wrapper with no institution auto-injection, used internally so
+// ensureInstitutionId() itself doesn't recurse into request().
+async function rawRequest(path, { method = "GET", body } = {}) {
   const headers = { "Content-Type": "application/json" };
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  const res = await fetch(`/api${path}`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(`/api${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new Error("Server unreachable - check that the backend is running.");
+  }
 
-  if (res.status === 401) {
+  // A 401 only means the session has actually expired when a token was sent
+  // with the request. Without this check, a wrong password on the login
+  // screen itself (which also returns 401, with no token attached) was
+  // being shown as "Session expired - please sign in again" instead of the
+  // real "Incorrect email or password".
+  if (res.status === 401 && token) {
     clearSession();
     window.location.hash = "#/login";
     throw new Error("Session expired - please sign in again");
   }
+
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
-    throw new Error(data?.detail || `Request failed (${res.status})`);
+    throw new Error(formatApiError(data, res.status));
   }
   return data;
+}
+
+function formatApiError(data, status) {
+  const detail = data?.detail;
+  if (typeof detail === "string") return detail;
+  // FastAPI/Pydantic 422 responses carry detail as a list of
+  // {loc, msg, type} objects, which previously rendered as the literal
+  // string "[object Object]" in the UI.
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d) => {
+        const field = Array.isArray(d.loc) ? d.loc[d.loc.length - 1] : null;
+        return field ? `${field}: ${d.msg}` : d.msg;
+      })
+      .join("; ");
+  }
+  return `Request failed (${status})`;
+}
+
+async function request(path, opts = {}) {
+  const user = getUser();
+  const isKitchenPath = path.startsWith("/kitchen");
+  if (user?.role === "super_admin" && isKitchenPath && !path.includes("institution_id=")) {
+    const instId = await ensureInstitutionId();
+    if (instId != null) path = appendQueryParam(path, "institution_id", instId);
+  }
+  return rawRequest(path, opts);
 }
 
 export const api = {
@@ -50,7 +128,7 @@ export const api = {
   patch: (p, body) => request(p, { method: "PATCH", body }),
 
   login: async (email, password) => {
-    const data = await request("/auth/login", {
+    const data = await rawRequest("/auth/login", {
       method: "POST",
       body: { email, password },
     });

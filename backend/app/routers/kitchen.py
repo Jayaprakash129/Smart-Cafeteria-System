@@ -8,16 +8,17 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_roles, scoped_institution_id
+from app.config import SEGMENT_PRICING
 from app.database import get_db
 from app.engines import forecasting, recommendation
-from app.engines.ngo_allocation import allocate
+from app.engines.ngo_allocation import allocate, sync_surplus_status
 from app.models import (
     AgentAction, DailySales, DemandForecast, Dish, Feedback, Ingredient,
     Institution, InventoryItem, MenuRecommendation, NGOAllocation,
     PriceRecommendation, SurplusRecord, TrialOffer, User, WastePrediction,
 )
 from app.schemas import (
-    InventoryUpdate, MenuDecision, OfferDecision, PriceDecision,
+    ActualSurplusUpdate, InventoryUpdate, MenuDecision, OfferDecision, PriceDecision,
 )
 
 router = APIRouter(prefix="/api/kitchen", tags=["kitchen-manager"])
@@ -193,6 +194,18 @@ def decide_price(decision: PriceDecision,
                 400,
                 f"Adjusted price {decision.adjusted_price} is below the "
                 f"cost-recovery floor of {r.price_floor}")
+        # The segment ceiling binds the human too: without this, a manual
+        # "adjust" could set an arbitrary price (e.g. Rs.9,99,999) because
+        # only the floor was ever checked.
+        dish = db.get(Dish, r.dish_id)
+        if dish is not None:
+            ceiling_mult = SEGMENT_PRICING.get(r.segment, {}).get("ceiling_mult")
+            anchor = dish.reference_price or dish.base_price
+            if ceiling_mult and decision.adjusted_price > anchor * ceiling_mult:
+                raise HTTPException(
+                    400,
+                    f"Adjusted price {decision.adjusted_price} exceeds the "
+                    f"{r.segment} segment ceiling of {round(anchor * ceiling_mult, 2)}")
         r.status, r.approved_price = "adjusted", decision.adjusted_price
     else:
         raise HTTPException(400, "action must be approve, reject or adjust")
@@ -371,18 +384,26 @@ def surplus(institution_id: int | None = None, target: date | None = None,
             "ngo_id": a.ngo_id, "ngo_name": a.ngo.name if a.ngo else "?",
             "contact_person": a.ngo.contact_person if a.ngo else "",
             "phone": a.ngo.phone if a.ngo else "",
+            "guarantee_pool": "vegetarian" if a.ngo and a.ngo.accepts_veg_only else "total",
             "quantity": 0, "share_pct": a.share_pct,
             "meets_guarantee": a.meets_guarantee, "pickup_slot": a.pickup_slot,
-            "status": a.status, "items": [], "allocation_ids": [],
+            "expiry_risk": False, "status_counts": {}, "items": [], "allocation_ids": [],
         })
         e["quantity"] += a.quantity
         e["allocation_ids"].append(a.id)
+        e["expiry_risk"] = e["expiry_risk"] or a.expiry_risk
+        e["status_counts"][a.status] = e["status_counts"].get(a.status, 0) + 1
         sr = db.get(SurplusRecord, a.surplus_id)
         if sr:
             e["items"].append({
                 "dish_name": dishes[sr.dish_id].name if sr.dish_id in dishes else "?",
                 "quantity": a.quantity, "is_veg": sr.is_veg,
                 "hours_to_expiry": sr.hours_to_expiry})
+    # Show one status only when every allocation to this NGO agrees;
+    # otherwise "mixed" rather than silently showing just the first row's
+    # status when, say, half a shared dish has been collected and half missed.
+    for e in by_ngo.values():
+        e["status"] = next(iter(e["status_counts"])) if len(e["status_counts"]) == 1 else "mixed"
 
     total = sum(r.quantity for r in records)
     distributed = sum(a.quantity for a in allocs)
@@ -413,14 +434,82 @@ def surplus(institution_id: int | None = None, target: date | None = None,
 def run_allocation(institution_id: int | None = None, target: date | None = None,
                    user: User = Depends(require_roles("kitchen_manager", "super_admin")),
                    db: Session = Depends(get_db)):
-    """Re-run the OR-Tools allocation on demand."""
+    """Re-run the OR-Tools allocation on demand.
+
+    Only "scheduled" allocations are cleared before re-solving -- a pickup
+    that has already been collected is historical fact and is never
+    deleted, so re-running never loses an NGO's collection record or
+    silently zeroes out food that is physically already gone. The engine's
+    own re-run safety (ngo_allocation.allocate) then re-solves only over
+    whatever quantity is still uncommitted.
+    """
     inst = _inst(db, user, institution_id)
     target = target or date.today()
     db.query(NGOAllocation).filter(
         NGOAllocation.institution_id == inst.id,
-        NGOAllocation.allocation_date == target).delete()
+        NGOAllocation.allocation_date == target,
+        NGOAllocation.status == "scheduled").delete()
     db.commit()
-    return allocate(db, inst.id, target, persist=True)
+    result = allocate(db, inst.id, target, persist=True)
+    surplus_ids = [s.id for s in db.query(SurplusRecord).filter(
+        SurplusRecord.institution_id == inst.id,
+        SurplusRecord.surplus_date == target).all()]
+    sync_surplus_status(db, surplus_ids)
+    db.commit()
+    return result
+
+
+@router.post("/surplus/actual")
+def record_actual_surplus(payload: ActualSurplusUpdate,
+                          institution_id: int | None = None, target: date | None = None,
+                          user: User = Depends(require_roles("kitchen_manager", "super_admin")),
+                          db: Session = Depends(get_db)):
+    """Let the kitchen enter real end-of-service leftovers and re-allocate.
+
+    The surplus NGOs see is otherwise only the morning's *predicted*
+    leftover quantity (from the Waste engine), never corrected against what
+    actually happened. This updates each dish's surplus quantity for the
+    target day to the reported actual value, then re-solves the allocation
+    exactly as a manual re-run would -- scheduled allocations are replaced,
+    collected ones are left untouched.
+    """
+    inst = _inst(db, user, institution_id)
+    target = target or date.today()
+    dishes = {d.id: d for d in db.query(Dish).filter(Dish.institution_id == inst.id).all()}
+
+    for entry in payload.items:
+        dish = dishes.get(entry.dish_id)
+        if dish is None:
+            raise HTTPException(404, f"Dish {entry.dish_id} not found at this institution")
+        record = db.query(SurplusRecord).filter(
+            SurplusRecord.institution_id == inst.id,
+            SurplusRecord.dish_id == entry.dish_id,
+            SurplusRecord.surplus_date == target).first()
+        if record is None:
+            if entry.actual_quantity <= 0:
+                continue
+            record = SurplusRecord(
+                institution_id=inst.id, dish_id=entry.dish_id, surplus_date=target,
+                quantity=entry.actual_quantity, unit_cost=dish.unit_cost,
+                hours_to_expiry=max(1, dish.shelf_life_hours - 2),
+                is_veg=dish.is_veg, status="available")
+            db.add(record)
+        else:
+            record.quantity = entry.actual_quantity
+    db.commit()
+
+    db.query(NGOAllocation).filter(
+        NGOAllocation.institution_id == inst.id,
+        NGOAllocation.allocation_date == target,
+        NGOAllocation.status == "scheduled").delete()
+    db.commit()
+    result = allocate(db, inst.id, target, persist=True)
+    surplus_ids = [s.id for s in db.query(SurplusRecord).filter(
+        SurplusRecord.institution_id == inst.id,
+        SurplusRecord.surplus_date == target).all()]
+    sync_surplus_status(db, surplus_ids)
+    db.commit()
+    return result
 
 
 @router.get("/reports")

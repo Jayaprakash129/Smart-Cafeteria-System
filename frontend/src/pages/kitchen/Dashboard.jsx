@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, money, num } from "../../api";
+import { api, getUser, money, num } from "../../api";
 import Layout from "../../components/Layout";
 import { Badge, Card, ErrorBox, Loading, Stat, Table } from "../../components/ui";
 
@@ -9,6 +9,9 @@ export default function Dashboard() {
   const [error, setError] = useState(null);
   const [running, setRunning] = useState(false);
   const [run, setRun] = useState(null);
+  // The pipeline-run endpoint is kitchen_manager/super_admin only; showing
+  // this button to a coordinator just produced a 403 on click.
+  const canRunPipeline = getUser()?.role !== "coordinator";
 
   const load = async () => {
     setError(null);
@@ -44,9 +47,11 @@ export default function Dashboard() {
       title="Today's Dashboard"
       subtitle={data ? `${data.institution.name} · ${data.date}` : "Loading"}
       actions={
-        <button onClick={runPipeline} disabled={running} className="btn-primary">
-          {running ? "Running agents…" : "▶ Run daily pipeline"}
-        </button>
+        canRunPipeline && (
+          <button onClick={runPipeline} disabled={running} className="btn-primary">
+            {running ? "Running agents…" : "▶ Run daily pipeline"}
+          </button>
+        )
       }
     >
       <ErrorBox error={error} onRetry={load} />

@@ -38,10 +38,12 @@ def menu(target: date | None = None, user: User = Depends(CustomerUser),
         MenuRecommendation.institution_id == inst_id,
         MenuRecommendation.target_date == target).all()}
 
+    # Only manager-approved offers are shown; a "pending" recommendation has
+    # not been signed off yet and should not already be live on the menu.
     offers = {o.dish_id: o for o in db.query(TrialOffer).filter(
         TrialOffer.customer_id == user.id,
         TrialOffer.offer_date == target,
-        TrialOffer.status.in_(["pending", "approved"])).all()}
+        TrialOffer.status == "approved").all()}
 
     ratings = {}
     for f in db.query(Feedback).filter(Feedback.institution_id == inst_id).all():
@@ -106,10 +108,11 @@ def place_order(payload: OrderCreate, user: User = Depends(CustomerUser),
         raise HTTPException(400, "Order must contain at least one item")
 
     today = date.today()
+    # Only approved offers are redeemable -- matches what /customer/menu shows.
     offers = {o.dish_id: o for o in db.query(TrialOffer).filter(
         TrialOffer.customer_id == user.id,
         TrialOffer.offer_date == today,
-        TrialOffer.status.in_(["pending", "approved"])).all()}
+        TrialOffer.status == "approved").all()}
 
     order = Order(institution_id=inst_id, customer_id=user.id, order_date=today,
                   placed_at=datetime.utcnow(), status="completed",
@@ -127,18 +130,37 @@ def place_order(payload: OrderCreate, user: User = Depends(CustomerUser),
             raise HTTPException(400, "Quantity must be at least 1")
 
         offer = offers.get(dish.id)
-        price = offer.offer_price if offer else dish.base_price
-        discount = (dish.base_price - price) if offer else 0.0
         if offer:
+            # The trial offer is a one-unit incentive to try the dish, not a
+            # bulk discount: only the first unit is discounted, the rest of
+            # the order is charged the normal price. Previously the whole
+            # quantity was charged at offer_price (a 15-unit order was
+            # entirely discounted).
+            discounted_qty = 1
+            full_qty = item.quantity - 1
+            discount = dish.base_price - offer.offer_price
+            db.add(OrderItem(order_id=order.id, dish_id=dish.id, quantity=discounted_qty,
+                             unit_price=offer.offer_price, unit_cost=dish.unit_cost,
+                             discount_applied=discount))
+            total += offer.offer_price * discounted_qty
+            if full_qty > 0:
+                db.add(OrderItem(order_id=order.id, dish_id=dish.id, quantity=full_qty,
+                                 unit_price=dish.base_price, unit_cost=dish.unit_cost,
+                                 discount_applied=0.0))
+                total += dish.base_price * full_qty
             offer.status = "redeemed"
-
-        db.add(OrderItem(order_id=order.id, dish_id=dish.id, quantity=item.quantity,
-                         unit_price=price, unit_cost=dish.unit_cost,
-                         discount_applied=discount))
-        total += price * item.quantity
-        lines.append({"dish_id": dish.id, "dish_name": dish.name,
-                      "quantity": item.quantity, "unit_price": price,
-                      "offer_applied": bool(offer)})
+            lines.append({"dish_id": dish.id, "dish_name": dish.name,
+                          "quantity": item.quantity, "unit_price": offer.offer_price,
+                          "offer_applied": True, "offer_units": discounted_qty})
+        else:
+            price = dish.base_price
+            db.add(OrderItem(order_id=order.id, dish_id=dish.id, quantity=item.quantity,
+                             unit_price=price, unit_cost=dish.unit_cost,
+                             discount_applied=0.0))
+            total += price * item.quantity
+            lines.append({"dish_id": dish.id, "dish_name": dish.name,
+                          "quantity": item.quantity, "unit_price": price,
+                          "offer_applied": False})
 
     order.total_amount = round(total, 2)
     db.commit()

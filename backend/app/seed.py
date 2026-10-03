@@ -224,11 +224,14 @@ def seed_all(verbose: bool = True) -> dict:
         for (name, cat, veg, spice, sweet, cost, shelf, share, wsens) in rows:
             # Segment-specific cost drift: corporate buys better inputs.
             cost_adj = cost * {"corporate": 1.10, "college": 1.0, "school": 0.88}[inst.segment]
+            seeded_price = price_for(inst.segment, cost_adj)
             d = Dish(
                 institution_id=inst.id, name=name, category=cat, is_veg=veg,
                 spice_level=spice, sweetness=sweet,
                 unit_cost=round(cost_adj, 2),
-                base_price=price_for(inst.segment, cost_adj),
+                base_price=seeded_price,
+                # Immutable pricing-band anchor -- see models.Dish.reference_price.
+                reference_price=seeded_price,
                 shelf_life_hours=shelf,
                 popularity_score=round(min(0.99, share / 1.6), 3),
             )

@@ -4,6 +4,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from app.auth import create_access_token, get_current_user, verify_password
+from app.config import DEMO_MODE
 from app.database import get_db
 from app.models import NGO, Institution, User
 from app.schemas import LoginRequest, TokenResponse
@@ -47,7 +48,16 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 
 @router.get("/demo-accounts")
 def demo_accounts(db: Session = Depends(get_db)):
-    """Convenience endpoint for the demo login screen."""
+    """Convenience endpoint for local demo use only.
+
+    The login screen's one-click buttons use hard-coded credentials and never
+    call this endpoint, so it otherwise serves no purpose except leaking
+    every role's password unauthenticated. Gated behind DEMO_MODE, which
+    defaults on for the local/demo deployment and must be explicitly
+    disabled (DEMO_MODE=false) in any shared or production environment.
+    """
+    if not DEMO_MODE:
+        raise HTTPException(404, "Not found")
     out = []
     for role, pwd in [("super_admin", "admin123"), ("kitchen_manager", "kitchen123"),
                       ("coordinator", "coord123"), ("ngo_partner", "ngo123"),

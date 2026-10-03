@@ -30,7 +30,7 @@ def load_panel(db_url: str = DATABASE_URL) -> pd.DataFrame:
     query = """
         SELECT s.*, d.name AS dish_name, d.category, d.cuisine, d.is_veg,
                d.spice_level, d.sweetness, d.shelf_life_hours,
-               d.popularity_score, d.base_price,
+               d.popularity_score, d.base_price, d.reference_price,
                i.segment, i.name AS institution_name, i.headcount
         FROM daily_sales s
         JOIN dishes d ON d.id = s.dish_id
