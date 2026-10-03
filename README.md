@@ -12,18 +12,20 @@ control, and a React dashboard covering all five roles.
 
 ## Quick start
 
-Two terminals.
+Requires **Python 3.10+** (the models use `X | None` type-hint syntax) and
+**Node 20+**. Run both commands below from the repository root, in two
+terminals.
 
 **Terminal 1 — backend**
 
 ```bash
-cd D:/FYP/backend && python -m uvicorn app.main:app --reload --port 8000
+cd backend && python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python -m uvicorn app.main:app --reload --port 8000
 ```
 
 **Terminal 2 — frontend**
 
 ```bash
-cd D:/FYP/frontend && npm run dev
+cd frontend && npm install && npm run dev
 ```
 
 Open **http://localhost:5173**. API docs at **http://localhost:8000/docs**.
@@ -31,14 +33,33 @@ Open **http://localhost:5173**. API docs at **http://localhost:8000/docs**.
 If the database is missing or you want a clean slate:
 
 ```bash
-cd D:/FYP/backend && python -m app.seed && python -c "from app.engines import forecasting,waste,trial_conversion; forecasting.train(); waste.train(); trial_conversion.train()"
+cd backend && python -m app.seed && python -c "from app.engines import forecasting,waste,trial_conversion; forecasting.train(); waste.train(); trial_conversion.train()"
 ```
 
 Verify everything works (48 checks):
 
 ```bash
-cd D:/FYP/backend && python smoke_test.py
+cd backend && python smoke_test.py
 ```
+
+Run the automated regression suite (isolated temp database, never touches
+the data above — see `backend/tests/`):
+
+```bash
+cd backend && pip install pytest && python -m pytest tests/ -v
+```
+
+### Configuration
+
+Sensible defaults are built in for local/demo use; override any of these via
+environment variables for anything beyond that:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | `sqlite:///backend/data/smart_cafeteria.db` | SQLAlchemy connection string (Postgres-swappable) |
+| `MODEL_DIR` | `backend/models_store` | Where trained `.joblib` models are read/written |
+| `JWT_SECRET` | a fixed demo string | **Set this in any shared or production deployment** |
+| `DEMO_MODE` | `true` | Gates `GET /api/auth/demo-accounts`, which otherwise lists every role's password unauthenticated. Set to `false` outside local demo use |
 
 ---
 
@@ -201,6 +222,7 @@ backend/
     external/weather.py  Open-Meteo with offline fallback
     routers/          auth, kitchen, admin, ngo, customer
   smoke_test.py       48 end-to-end checks
+  tests/              pytest regression suite, isolated temp DB
 frontend/src/
   pages/kitchen/      dashboard, pricing, forecast, inventory, offers, surplus, reports
   pages/admin/        global dashboard, institutions, NGOs, engines, impact, audit

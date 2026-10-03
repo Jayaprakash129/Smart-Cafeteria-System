@@ -40,7 +40,13 @@ function Landing() {
 }
 
 const STAFF = ["kitchen_manager", "super_admin", "coordinator"];
-const ADMIN = ["super_admin", "coordinator"];
+// Cross-institution pages (global dashboard, institution/NGO directories) are
+// super_admin only -- the backend now enforces this too, but a coordinator
+// should never even see the links or land on a 403 page client-side.
+const ADMIN = ["super_admin"];
+// Impact and the audit log are scoped server-side to the caller's own
+// institution for non-admins, so a coordinator can safely view these.
+const IMPACT_AUDIT = ["super_admin", "coordinator"];
 
 export default function App() {
   return (
@@ -63,8 +69,8 @@ export default function App() {
         <Route path="/admin/institutions" element={<Protected roles={ADMIN}><Institutions /></Protected>} />
         <Route path="/admin/ngos" element={<Protected roles={ADMIN}><NGOPartners /></Protected>} />
         <Route path="/admin/engines" element={<Protected roles={ADMIN}><Engines /></Protected>} />
-        <Route path="/admin/impact" element={<Protected roles={ADMIN}><Impact /></Protected>} />
-        <Route path="/admin/audit" element={<Protected roles={ADMIN}><Audit /></Protected>} />
+        <Route path="/admin/impact" element={<Protected roles={IMPACT_AUDIT}><Impact /></Protected>} />
+        <Route path="/admin/audit" element={<Protected roles={IMPACT_AUDIT}><Audit /></Protected>} />
 
         {/* NGO Partner */}
         <Route path="/ngo" element={<Protected roles={["ngo_partner", "super_admin"]}><NGOToday /></Protected>} />

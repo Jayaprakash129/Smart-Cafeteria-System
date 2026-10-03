@@ -3,7 +3,13 @@ from __future__ import annotations
 
 from datetime import date
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.auth import ROLES
+
+# A simple, dependency-free email shape check (no email-validator package
+# required): local part, @, domain, a dot, TLD.
+EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 
 class LoginRequest(BaseModel):
@@ -35,7 +41,7 @@ class OfferDecision(BaseModel):
 
 class InventoryUpdate(BaseModel):
     item_id: int
-    quantity_on_hand: float
+    quantity_on_hand: float = Field(ge=0)
     expiry_date: date | None = None
 
 
@@ -45,16 +51,23 @@ class PickupUpdate(BaseModel):
 
 
 class NGOProfileUpdate(BaseModel):
-    daily_need_meals: int | None = None
-    beneficiaries: int | None = None
+    daily_need_meals: int | None = Field(default=None, ge=0)
+    beneficiaries: int | None = Field(default=None, ge=0)
     accepts_veg_only: bool | None = None
     contact_person: str | None = None
     phone: str | None = None
+    # Only ever honoured on the admin endpoint (routers/admin.py); the NGO
+    # self-service endpoint (routers/ngo.py) explicitly strips both before
+    # applying this payload, the same way it already strips
+    # reliability_score -- an NGO must never be able to self-verify or
+    # reactivate/deactivate its own account.
+    verified: bool | None = None
+    active: bool | None = None
 
 
 class OrderItemIn(BaseModel):
     dish_id: int
-    quantity: int = 1
+    quantity: int = Field(default=1, ge=1, le=50)
 
 
 class OrderCreate(BaseModel):
@@ -71,21 +84,37 @@ class FeedbackCreate(BaseModel):
 class InstitutionCreate(BaseModel):
     name: str
     segment: str
-    headcount: int = 500
+    headcount: int = Field(default=500, gt=0)
     city: str = "Chennai"
     latitude: float = 13.0827
     longitude: float = 80.2707
 
 
 class UserCreate(BaseModel):
-    email: str
+    email: str = Field(pattern=EMAIL_PATTERN)
     full_name: str
-    password: str
+    password: str = Field(min_length=8)
     role: str
     institution_id: int | None = None
     ngo_id: int | None = None
+
+    @field_validator("role")
+    @classmethod
+    def _role_whitelist(cls, v: str) -> str:
+        if v not in ROLES:
+            raise ValueError(f"role must be one of {ROLES}")
+        return v
 
 
 class PipelineRequest(BaseModel):
     institution_id: int | None = None
     target_date: date | None = None
+
+
+class ActualSurplusEntry(BaseModel):
+    dish_id: int
+    actual_quantity: int = Field(ge=0)
+
+
+class ActualSurplusUpdate(BaseModel):
+    items: list[ActualSurplusEntry]

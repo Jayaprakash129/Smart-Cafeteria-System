@@ -4,6 +4,8 @@ Layers mirror the architecture in DOCS/: operational/data entities feed the
 intelligence-layer engines, whose outputs are persisted back here so every
 recommendation is auditable.
 """
+from __future__ import annotations
+
 from datetime import date, datetime
 
 from sqlalchemy import (
@@ -71,6 +73,13 @@ class Dish(Base):
     # Cost to produce one unit -- the basis of the cost+20% price floor.
     unit_cost: Mapped[float] = mapped_column(Float)
     base_price: Mapped[float] = mapped_column(Float)
+    # Fixed anchor for the segment pricing band, set once at creation and
+    # never mutated by approvals. The pricing engine must band around this,
+    # not around base_price -- base_price changes every time a manager
+    # approves a recommendation, and anchoring the band to a value the
+    # engine itself just moved compounds a price increase every single day
+    # it runs (a "price ratchet").
+    reference_price: Mapped[float] = mapped_column(Float, default=0.0)
     shelf_life_hours: Mapped[int] = mapped_column(Integer, default=6)
     popularity_score: Mapped[float] = mapped_column(Float, default=0.5)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -318,6 +327,9 @@ class NGOAllocation(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     share_pct: Mapped[float] = mapped_column(Float, default=0.0)
     meets_guarantee: Mapped[bool] = mapped_column(Boolean, default=True)
+    # True when no pickup slot could be found before this item's predicted
+    # expiry -- surfaced to the kitchen/NGO rather than silently dropped.
+    expiry_risk: Mapped[bool] = mapped_column(Boolean, default=False)
     pickup_slot: Mapped[str] = mapped_column(String(40), default="18:00-19:00")
     status: Mapped[str] = mapped_column(String(20), default="scheduled")  # scheduled|collected|missed
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

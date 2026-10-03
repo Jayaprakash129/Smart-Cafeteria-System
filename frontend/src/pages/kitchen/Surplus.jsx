@@ -7,6 +7,8 @@ export default function Surplus() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [actuals, setActuals] = useState({});
+  const [savingActuals, setSavingActuals] = useState(false);
 
   const load = async () => {
     setError(null);
@@ -34,6 +36,27 @@ export default function Surplus() {
     }
   };
 
+  // The surplus shown here starts as the morning's *predicted* leftovers.
+  // This lets the kitchen correct it to what was actually left at close of
+  // service and immediately re-solve the allocation from the real numbers.
+  const saveActuals = async () => {
+    const items = Object.entries(actuals)
+      .filter(([, v]) => v !== "" && v !== undefined)
+      .map(([dish_id, v]) => ({ dish_id: Number(dish_id), actual_quantity: Number(v) }));
+    if (!items.length) return;
+    setSavingActuals(true);
+    setError(null);
+    try {
+      await api.post("/kitchen/surplus/actual", { items });
+      setActuals({});
+      await load();
+    } catch (e) {
+      setError(e);
+    } finally {
+      setSavingActuals(false);
+    }
+  };
+
   const s = data?.summary;
 
   return (
@@ -41,9 +64,16 @@ export default function Surplus() {
       title="Surplus & NGO Handoff"
       subtitle={data ? `${data.institution} · ${data.date}` : ""}
       actions={
-        <button className="btn-primary" disabled={busy} onClick={reallocate}>
-          {busy ? "Solving…" : "↻ Re-run allocation"}
-        </button>
+        <div className="flex items-center gap-2">
+          {Object.keys(actuals).length > 0 && (
+            <button className="btn-ghost" disabled={savingActuals} onClick={saveActuals}>
+              {savingActuals ? "Saving…" : "Save actuals & reallocate"}
+            </button>
+          )}
+          <button className="btn-primary" disabled={busy} onClick={reallocate}>
+            {busy ? "Solving…" : "↻ Re-run allocation"}
+          </button>
+        </div>
       }
     >
       <ErrorBox error={error} onRetry={load} />
@@ -99,6 +129,7 @@ export default function Surplus() {
                         <Badge tone={a.status === "collected" ? "blue" : "slate"}>
                           {a.status}
                         </Badge>
+                        {a.expiry_risk && <Badge tone="red">pickup may be after expiry</Badge>}
                       </div>
                       <div className="mt-0.5 text-xs text-slate-500">
                         {a.contact_person} · {a.phone} · pickup {a.pickup_slot}
@@ -110,6 +141,11 @@ export default function Surplus() {
                       </div>
                       <div className="text-xs text-slate-500">
                         {a.share_pct}% of today's surplus
+                        {a.guarantee_pool === "vegetarian" && (
+                          <span className="block text-slate-400">
+                            20% guarantee measured against vegetarian surplus only
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -182,6 +218,23 @@ export default function Surplus() {
                   key: "status",
                   label: "Status",
                   render: (r) => <Badge tone={r.status === "collected" ? "blue" : "slate"}>{r.status}</Badge>,
+                },
+                {
+                  key: "actual",
+                  label: "Actual leftover",
+                  align: "right",
+                  render: (r) => (
+                    <input
+                      type="number"
+                      min="0"
+                      placeholder={r.quantity}
+                      className="input w-24 py-1 text-right"
+                      value={actuals[r.dish_id] ?? ""}
+                      onChange={(e) =>
+                        setActuals((s) => ({ ...s, [r.dish_id]: e.target.value }))
+                      }
+                    />
+                  ),
                 },
               ]}
               rows={data.surplus_items}

@@ -141,17 +141,26 @@ def _feature_row_for(hist: pd.DataFrame, target: date, weather: dict) -> dict:
     }
 
 
-def forecast_institution(institution_id: int, target: date,
-                         weather: dict | None = None) -> list[dict]:
-    """Forecast every active dish at an institution for `target`."""
+def _load_context(institution_id: int):
+    """Load the trained model bundle and this institution's feature panel once.
+
+    Both are independent of the target date, so callers that forecast
+    multiple days (forecast_week) must load them once and reuse them rather
+    than repeating a full model load + 29k-row panel rebuild per day.
+    """
     bundle = _load()
+    df = add_features(load_panel())
+    df = df[df["institution_id"] == institution_id]
+    return bundle, df
+
+
+def _forecast_with_context(bundle: dict, df: pd.DataFrame, institution_id: int,
+                           target: date, weather: dict | None = None) -> list[dict]:
     model = bundle["model"]
     rel_err = bundle.get("rel_err", {})
     global_rel_err = bundle.get("global_rel_err", 0.20)
     weather = weather or {}
 
-    df = add_features(load_panel())
-    df = df[df["institution_id"] == institution_id]
     if df.empty:
         return []
 
@@ -169,6 +178,7 @@ def forecast_institution(institution_id: int, target: date,
             "unit_cost": float(last["unit_cost"]),
             "unit_price": float(last["unit_price"]),
             "base_price": float(last["base_price"]),
+            "reference_price": float(last.get("reference_price", last["base_price"])),
             "shelf_life_hours": int(last["shelf_life_hours"]),
         })
 
@@ -193,13 +203,26 @@ def forecast_institution(institution_id: int, target: date,
     return sorted(out, key=lambda r: -r["predicted_demand"])
 
 
+def forecast_institution(institution_id: int, target: date,
+                         weather: dict | None = None) -> list[dict]:
+    """Forecast every active dish at an institution for `target`."""
+    bundle, df = _load_context(institution_id)
+    return _forecast_with_context(bundle, df, institution_id, target, weather)
+
+
 def forecast_week(institution_id: int, start: date | None = None) -> list[dict]:
-    """Seven-day outlook used by the Demand Forecast View screen."""
+    """Seven-day outlook used by the Demand Forecast View screen.
+
+    Loads the model and feature panel once and reuses them across all seven
+    days -- previously each day repeated both from scratch, which is what
+    made this endpoint take ~7 seconds instead of ~1.
+    """
     start = start or date.today()
+    bundle, df = _load_context(institution_id)
     results = []
     for offset in range(7):
         target = start + timedelta(days=offset)
-        day = forecast_institution(institution_id, target)
+        day = _forecast_with_context(bundle, df, institution_id, target)
         results.append({
             "date": target.isoformat(),
             "day_name": target.strftime("%a"),

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.agents.graph import run_daily_pipeline
-from app.auth import hash_password, require_roles
+from app.auth import hash_password, require_roles, scoped_institution_id
 from app.config import NGO_MIN_GUARANTEE, PRICE_FLOOR_MARGIN, SEGMENT_PRICING, TRIAL_DISCOUNT
 from app.database import get_db
 from app.engines import forecasting, trial_conversion, waste
@@ -25,8 +25,13 @@ AnyStaff = require_roles("super_admin", "kitchen_manager", "coordinator")
 
 @router.get("/dashboard")
 def global_dashboard(days: int = Query(30, ge=7, le=365),
-                     user: User = Depends(AnyStaff), db: Session = Depends(get_db)):
-    """Cross-institution overview."""
+                     user: User = Depends(AdminUser), db: Session = Depends(get_db)):
+    """Cross-institution overview -- super-admin only.
+
+    This aggregates every institution's revenue in one response; a kitchen
+    manager or coordinator from institution A must not be able to read
+    institution B's numbers through it.
+    """
     start = date.today() - timedelta(days=days)
     institutions = db.query(Institution).filter(Institution.active == True).all()  # noqa: E712
 
@@ -76,7 +81,9 @@ def global_dashboard(days: int = Query(30, ge=7, le=365),
 
 
 @router.get("/institutions")
-def list_institutions(user: User = Depends(AnyStaff), db: Session = Depends(get_db)):
+def list_institutions(user: User = Depends(AdminUser), db: Session = Depends(get_db)):
+    """Every client institution -- super-admin only (names, headcounts and
+    customer/staff counts for sites the caller may not belong to)."""
     rows = db.query(Institution).all()
     return [{
         "id": i.id, "name": i.name, "segment": i.segment, "city": i.city,
@@ -133,9 +140,14 @@ def list_users(role: str | None = None, institution_id: int | None = None,
 @router.post("/users")
 def create_user(payload: UserCreate, user: User = Depends(AdminUser),
                 db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == payload.email).first():
+    # Compare case-insensitively against the same normalised form that gets
+    # stored below -- otherwise "Admin@x.com" and "admin@x.com" both pass
+    # this check as "distinct" and then collide on the column's actual
+    # unique constraint, surfacing as an unhandled 500 instead of a 409.
+    email_norm = payload.email.lower().strip()
+    if db.query(User).filter(User.email == email_norm).first():
         raise HTTPException(409, "Email already registered")
-    u = User(email=payload.email.lower().strip(), full_name=payload.full_name,
+    u = User(email=email_norm, full_name=payload.full_name,
              hashed_password=hash_password(payload.password), role=payload.role,
              institution_id=payload.institution_id, ngo_id=payload.ngo_id)
     db.add(u)
@@ -144,7 +156,9 @@ def create_user(payload: UserCreate, user: User = Depends(AdminUser),
 
 
 @router.get("/ngos")
-def list_ngos(user: User = Depends(AnyStaff), db: Session = Depends(get_db)):
+def list_ngos(user: User = Depends(AdminUser), db: Session = Depends(get_db)):
+    """NGO partner directory -- super-admin only (includes phone numbers and
+    contact names that a kitchen manager or coordinator has no need to see)."""
     start = date.today() - timedelta(days=30)
     rows = db.query(NGO).all()
     out = []
@@ -267,10 +281,19 @@ def retrain(user: User = Depends(AdminUser)):
 def audit_log(limit: int = Query(100, le=500), run_id: str | None = None,
               institution_id: int | None = None,
               user: User = Depends(AnyStaff), db: Session = Depends(get_db)):
+    """Agent decision audit trail.
+
+    A super_admin may view any institution or the whole platform at once;
+    everyone else is pinned to their own institution's entries regardless of
+    what institution_id they pass, so a kitchen manager cannot browse
+    another cafeteria's agent actions.
+    """
     q = db.query(AgentAction)
     if run_id:
         q = q.filter(AgentAction.run_id == run_id)
-    if institution_id:
+    if user.role != "super_admin":
+        q = q.filter(AgentAction.institution_id == scoped_institution_id(user, institution_id))
+    elif institution_id:
         q = q.filter(AgentAction.institution_id == institution_id)
     rows = q.order_by(AgentAction.id.desc()).limit(limit).all()
     insts = {i.id: i.name for i in db.query(Institution).all()}
@@ -284,25 +307,44 @@ def audit_log(limit: int = Query(100, le=500), run_id: str | None = None,
 
 
 @router.get("/impact")
-def impact_report(days: int = Query(30, ge=7, le=365),
+def impact_report(days: int = Query(30, ge=7, le=365), institution_id: int | None = None,
                   user: User = Depends(AnyStaff), db: Session = Depends(get_db)):
-    """Headline outcome metrics - the numbers for the project paper."""
+    """Headline outcome metrics - the numbers for the project paper.
+
+    A super_admin with no institution_id gets the platform-wide figures (the
+    original behaviour); anyone else is scoped to their own institution
+    regardless of what they pass, since this previously summed revenue and
+    waste across every institution for any staff role that asked.
+    """
+    scope_id = institution_id if user.role == "super_admin" else scoped_institution_id(user, institution_id)
     start = date.today() - timedelta(days=days)
-    rows = db.query(DailySales).filter(DailySales.sales_date >= start).all()
+
+    sales_q = db.query(DailySales).filter(DailySales.sales_date >= start)
+    alloc_q = db.query(NGOAllocation).filter(NGOAllocation.allocation_date >= start)
+    surplus_q = db.query(SurplusRecord).filter(SurplusRecord.surplus_date >= start)
+    offers_q = db.query(TrialOffer).filter(TrialOffer.offer_date >= start)
+    price_q = db.query(PriceRecommendation).filter(PriceRecommendation.target_date >= start)
+    if scope_id is not None:
+        sales_q = sales_q.filter(DailySales.institution_id == scope_id)
+        alloc_q = alloc_q.filter(NGOAllocation.institution_id == scope_id)
+        surplus_q = surplus_q.filter(SurplusRecord.institution_id == scope_id)
+        offers_q = offers_q.filter(TrialOffer.institution_id == scope_id)
+        price_q = price_q.filter(PriceRecommendation.institution_id == scope_id)
+
+    rows = sales_q.all()
     sold = sum(r.quantity_sold for r in rows)
     left = sum(r.quantity_leftover for r in rows)
     prepared = sum(r.quantity_prepared for r in rows)
     revenue = sum(r.revenue for r in rows)
     cost = sum(r.unit_cost * r.quantity_prepared for r in rows)
 
-    allocs = db.query(NGOAllocation).filter(NGOAllocation.allocation_date >= start).all()
-    surplus = db.query(SurplusRecord).filter(SurplusRecord.surplus_date >= start).all()
+    allocs = alloc_q.all()
+    surplus = surplus_q.all()
     total_surplus = sum(s.quantity for s in surplus)
     donated = sum(a.quantity for a in allocs)
 
-    offers = db.query(TrialOffer).filter(TrialOffer.offer_date >= start).all()
-    price_recs = db.query(PriceRecommendation).filter(
-        PriceRecommendation.target_date >= start).all()
+    offers = offers_q.all()
+    price_recs = price_q.all()
 
     fc = forecasting.get_metrics()
     tc = trial_conversion.get_metrics()

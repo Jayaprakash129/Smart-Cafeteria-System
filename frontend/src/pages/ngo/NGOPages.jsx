@@ -53,7 +53,11 @@ export function NGOToday() {
             <Stat
               label="Guarantee"
               value={s.all_meet_guarantee ? "Met" : "Below"}
-              sub={`minimum ${s.guarantee_pct}% share`}
+              sub={
+                s.guarantee_pool === "vegetarian"
+                  ? `minimum ${s.guarantee_pct}% of vegetarian surplus`
+                  : `minimum ${s.guarantee_pct}% share`
+              }
               tone={s.all_meet_guarantee ? "good" : "warn"}
             />
             <Stat label="Pending pickups" value={s.pending_pickups} sub="awaiting collection" />
@@ -91,7 +95,9 @@ export function NGOToday() {
                       </button>
                     </div>
                   ) : (
-                    <Badge tone={p.status === "collected" ? "green" : "red"}>{p.status}</Badge>
+                    <Badge tone={p.status === "collected" ? "green" : p.status === "mixed" ? "amber" : "red"}>
+                      {p.status}
+                    </Badge>
                   )
                 }
               >
@@ -183,11 +189,20 @@ export function NGOHistory() {
                 {
                   key: "status",
                   label: "Status",
-                  render: (r) => (
-                    <Badge tone={r.status === "collected" ? "green" : r.status === "missed" ? "red" : "slate"}>
-                      {r.status}
-                    </Badge>
-                  ),
+                  render: (r) =>
+                    r.status === "mixed" ? (
+                      <span className="flex flex-wrap gap-1">
+                        {Object.entries(r.status_counts || {}).map(([st, n]) => (
+                          <Badge key={st} tone={st === "collected" ? "green" : st === "missed" ? "red" : "slate"}>
+                            {st} ×{n}
+                          </Badge>
+                        ))}
+                      </span>
+                    ) : (
+                      <Badge tone={r.status === "collected" ? "green" : r.status === "missed" ? "red" : "slate"}>
+                        {r.status}
+                      </Badge>
+                    ),
                 },
               ]}
               rows={[...(data.daily || [])].reverse()}

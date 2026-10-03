@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.auth import require_roles
 from app.config import NGO_MIN_GUARANTEE
 from app.database import get_db
+from app.engines.ngo_allocation import allocate, sync_surplus_status
 from app.models import Dish, Institution, NGO, NGOAllocation, SurplusRecord, User
 from app.schemas import NGOProfileUpdate, PickupUpdate
 
@@ -49,13 +50,14 @@ def today(ngo_id: int | None = None, target: date | None = None,
             "institution_id": a.institution_id,
             "institution_name": insts[a.institution_id].name
             if a.institution_id in insts else "?",
-            "pickup_slot": a.pickup_slot, "status": a.status,
+            "pickup_slot": a.pickup_slot, "status_counts": {},
             "quantity": 0, "share_pct": a.share_pct,
             "meets_guarantee": a.meets_guarantee,
             "allocation_ids": [], "items": [],
         })
         e["quantity"] += a.quantity
         e["allocation_ids"].append(a.id)
+        e["status_counts"][a.status] = e["status_counts"].get(a.status, 0) + 1
         sr = db.get(SurplusRecord, a.surplus_id)
         if sr:
             dish = db.get(Dish, sr.dish_id)
@@ -64,6 +66,12 @@ def today(ngo_id: int | None = None, target: date | None = None,
                 "quantity": a.quantity, "is_veg": sr.is_veg,
                 "hours_to_expiry": sr.hours_to_expiry,
             })
+    # A pickup can span multiple dishes that are not all confirmed in the
+    # same action; show a single "status" only when every part agrees, and
+    # "mixed" otherwise rather than silently reporting just the first row's.
+    for e in by_inst.values():
+        e["status"] = (next(iter(e["status_counts"]))
+                       if len(e["status_counts"]) == 1 else "mixed")
 
     total = sum(v["quantity"] for v in by_inst.values())
     return {
@@ -78,6 +86,12 @@ def today(ngo_id: int | None = None, target: date | None = None,
             if ngo.daily_need_meals else 0.0,
             "institutions": len(by_inst),
             "guarantee_pct": NGO_MIN_GUARANTEE * 100,
+            # Which surplus pool the guarantee percentage above is measured
+            # against -- a veg-only NGO's 20% is of the *vegetarian* surplus
+            # only, not the cafeteria's total surplus, and showing a bare
+            # "18% of surplus" next to "guarantee met" otherwise reads as
+            # contradictory.
+            "guarantee_pool": "vegetarian" if ngo.accepts_veg_only else "total",
             "all_meet_guarantee": all(v["meets_guarantee"] for v in by_inst.values())
             if by_inst else False,
             "pending_pickups": sum(1 for v in by_inst.values() if v["status"] == "scheduled"),
@@ -89,7 +103,13 @@ def today(ngo_id: int | None = None, target: date | None = None,
 @router.post("/pickups/confirm")
 def confirm_pickup(payload: PickupUpdate, user: User = Depends(NGOUser),
                    db: Session = Depends(get_db)):
-    """Mark allocations collected or missed; reliability updates from this."""
+    """Mark allocations collected or missed; reliability updates from this.
+
+    Only allocations still in "scheduled" state can be confirmed -- without
+    this guard the same pickup could be confirmed over and over, each time
+    re-running the reliability-score update and making it drift (observed:
+    0.93 -> 0.98 -> 0.68 -> 0.78 from repeated confirmations of one pickup).
+    """
     if payload.status not in ("collected", "missed"):
         raise HTTPException(400, "status must be collected or missed")
     rows = db.query(NGOAllocation).filter(
@@ -101,11 +121,18 @@ def confirm_pickup(payload: PickupUpdate, user: User = Depends(NGOUser),
     for r in rows:
         if r.ngo_id != nid:
             raise HTTPException(403, "Cross-NGO access denied")
+
+    actionable = [r for r in rows if r.status == "scheduled"]
+    if not actionable:
+        raise HTTPException(
+            409, "These pickups have already been confirmed and cannot be changed")
+
+    affected: set[tuple[int, date]] = set()
+    for r in actionable:
         r.status = payload.status
-        if payload.status == "collected":
-            sr = db.get(SurplusRecord, r.surplus_id)
-            if sr:
-                sr.status = "collected"
+        affected.add((r.institution_id, r.allocation_date))
+    db.flush()
+    sync_surplus_status(db, [r.surplus_id for r in actionable])
 
     # Reliability is learned from behaviour rather than self-reported: it feeds
     # straight back into the allocation objective on the next run.
@@ -117,7 +144,26 @@ def confirm_pickup(payload: PickupUpdate, user: User = Depends(NGOUser),
         rate = sum(1 for h in history if h.status == "collected") / len(history)
         ngo.reliability_score = round(0.7 * ngo.reliability_score + 0.3 * rate, 3)
     db.commit()
-    return {"status": "ok", "updated": len(rows),
+
+    # A missed pickup's food must not simply sit "allocated" and wasted --
+    # re-run the allocation for every (institution, date) touched by a miss
+    # so the freed quantity is immediately re-offered to another NGO.
+    if payload.status == "missed":
+        for institution_id, allocation_date in affected:
+            db.query(NGOAllocation).filter(
+                NGOAllocation.institution_id == institution_id,
+                NGOAllocation.allocation_date == allocation_date,
+                NGOAllocation.status == "scheduled").delete()
+            db.commit()
+            allocate(db, institution_id, allocation_date, persist=True)
+            surplus_ids = [s.id for s in db.query(SurplusRecord).filter(
+                SurplusRecord.institution_id == institution_id,
+                SurplusRecord.surplus_date == allocation_date).all()]
+            sync_surplus_status(db, surplus_ids)
+            db.commit()
+
+    return {"status": "ok", "updated": len(actionable),
+            "skipped_already_settled": len(rows) - len(actionable),
             "new_reliability_score": ngo.reliability_score}
 
 
@@ -136,12 +182,20 @@ def history(ngo_id: int | None = None, days: int = Query(30, ge=7, le=365),
     for r in rows:
         k = r.allocation_date.isoformat()
         e = by_date.setdefault(k, {"date": k, "quantity": 0, "institutions": set(),
-                                   "status": r.status})
+                                   "status_counts": {}})
         e["quantity"] += r.quantity
         e["institutions"].add(insts.get(r.institution_id, "?"))
-    series = [{"date": v["date"], "quantity": v["quantity"],
-               "institutions": sorted(v["institutions"]), "status": v["status"]}
-              for v in sorted(by_date.values(), key=lambda e: e["date"])]
+        e["status_counts"][r.status] = e["status_counts"].get(r.status, 0) + 1
+    series = [{
+        "date": v["date"], "quantity": v["quantity"],
+        "institutions": sorted(v["institutions"]),
+        "status_counts": v["status_counts"],
+        # Backward-compatible single-status summary: the day's one status if
+        # every pickup that day shares it, otherwise "mixed" -- previously
+        # this field silently showed only the first row's status even when a
+        # day held a mix of collected and missed pickups.
+        "status": next(iter(v["status_counts"])) if len(v["status_counts"]) == 1 else "mixed",
+    } for v in sorted(by_date.values(), key=lambda e: e["date"])]
 
     collected = sum(1 for r in rows if r.status == "collected")
     return {
@@ -178,8 +232,12 @@ def update_profile(payload: NGOProfileUpdate, ngo_id: int | None = None,
     if n is None:
         raise HTTPException(404, "NGO not found")
     data = payload.model_dump(exclude_none=True)
-    # Reliability is measured, never self-declared.
-    data.pop("reliability_score", None)
+    # Reliability is measured, never self-declared, and verification/active
+    # status are platform-governance decisions -- an NGO must not be able to
+    # self-verify or reactivate/deactivate its own account through the
+    # profile form it otherwise shares with the admin endpoint.
+    for guarded in ("reliability_score", "verified", "active"):
+        data.pop(guarded, None)
     for k, v in data.items():
         setattr(n, k, v)
     db.commit()

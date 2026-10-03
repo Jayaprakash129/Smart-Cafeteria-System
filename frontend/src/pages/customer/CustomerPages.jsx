@@ -25,10 +25,18 @@ export function CustomerMenu() {
     });
 
   const items = (data?.items || []).filter((i) => cat === "all" || i.category === cat);
+  // The trial offer discounts exactly one unit per order (see
+  // routers/customer.py place_order) -- any additional units of that dish
+  // are charged the normal price, so the cart preview must match or the
+  // total shown here would disagree with what checkout actually charges.
   const cartLines = Object.entries(cart).map(([id, qty]) => {
     const dish = data.items.find((i) => i.dish_id === Number(id));
-    const price = dish?.offer?.offer_price ?? dish?.price ?? 0;
-    return { dish, qty, price, line: price * qty };
+    const fullPrice = dish?.price ?? 0;
+    const offerPrice = dish?.offer?.offer_price;
+    const discountedUnits = offerPrice != null ? Math.min(1, qty) : 0;
+    const line =
+      discountedUnits * offerPrice + (qty - discountedUnits) * fullPrice;
+    return { dish, qty, price: offerPrice ?? fullPrice, discountedUnits, line };
   });
   const total = cartLines.reduce((s, l) => s + l.line, 0);
 

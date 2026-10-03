@@ -119,8 +119,14 @@ def recommend_prices(forecasts: list[dict], segment: str,
         roll = f.get("roll_7_demand") or demand
         demand_ratio = demand / roll if roll else 1.0
 
+        # Band around the dish's fixed reference price, never around the
+        # live base_price -- base_price is overwritten every time a manager
+        # approves a recommendation, so anchoring to it would let each day's
+        # approval raise the ceiling for the next day's recommendation,
+        # compounding into runaway prices (a "price ratchet").
+        band_anchor = f.get("reference_price") or f["base_price"]
         rec = optimal_price(
-            unit_cost=f["unit_cost"], base_price=f["base_price"],
+            unit_cost=f["unit_cost"], base_price=band_anchor,
             segment=segment, waste_risk=waste_risk, demand_ratio=demand_ratio,
         )
         projected_profit = (rec["recommended_price"] - f["unit_cost"]) * demand
