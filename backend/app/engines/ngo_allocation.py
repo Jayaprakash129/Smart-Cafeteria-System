@@ -43,15 +43,21 @@ Constraints enforced:
                          solved allocation land a hair under 20% and then
                          legitimately report the guarantee as unmet.
 
-Cross-institution capacity
----------------------------
+Daily capacity across institutions and re-runs
+------------------------------------------------
 The daily pipeline runs once per institution. Solved independently, nothing
 stops two institutions from each promising the same NGO its full daily
 capacity on the same day -- an NGO partnered with three cafeterias could be
 offered 3x more food than it can actually take. Before solving for one
-institution, this engine looks up what that NGO has already been scheduled
-or has collected today at every OTHER institution, and subtracts it from the
-capacity (and the 20% guarantee cap) used in this solve.
+institution, this engine looks up every allocation that NGO already holds
+today -- scheduled or collected, from ANY institution, including this same
+one from an earlier pass -- and subtracts that total from the capacity (and
+the 20% guarantee cap) used in this solve. The "including this same one"
+part matters: the pipeline or a manual re-run can solve the same
+institution more than once in a day as new surplus becomes uncommitted, and
+excluding that institution's own prior commitment would let two passes
+combined exceed the NGO's daily need even though neither pass individually
+did.
 
 Re-run safety
 -------------
@@ -154,22 +160,32 @@ def _recent_share(db: Session, ngo_id: int, as_of: date, window: int = 14) -> fl
     return mine / total
 
 
-def _cross_institution_state(db: Session, ngo_ids: list[int], target: date,
-                             exclude_institution_id: int
-                             ) -> tuple[dict[int, int], dict[int, list[tuple[int, int]]]]:
-    """What each NGO has already been promised/collected today, elsewhere.
+def _committed_state(db: Session, ngo_ids: list[int], target: date
+                     ) -> tuple[dict[int, int], dict[int, list[tuple[int, int]]]]:
+    """What each NGO has already been promised/collected today, anywhere.
 
     Returns (given_today, busy_slots) keyed by ngo_id. `given_today` feeds
-    the cross-institution capacity cap; `busy_slots` is the set of time
-    windows already booked for that NGO today, so this institution's pickup
-    assignment can avoid double-booking it.
+    the daily capacity cap; `busy_slots` is the set of time windows already
+    booked for that NGO today, so this solve's pickup assignment can avoid
+    double-booking it.
+
+    Deliberately NOT scoped to "other institutions" -- it must also include
+    this institution's OWN prior commitments to the NGO today. The pipeline
+    (or a manual re-run) can solve the same institution more than once in a
+    day as new surplus becomes uncommitted; if an NGO's first-pass
+    allocation here were excluded from its own capacity check on a second
+    pass, the two passes combined could hand it more than its stated daily
+    need even though neither pass individually exceeded it. Surplus
+    quantities are already protected from being double-given by the
+    uncommitted-remainder tracking in allocate() -- this only needs to cap
+    the NGO's total daily *capacity*, which is agnostic to which institution
+    or which pass a prior commitment came from.
     """
     if not ngo_ids:
         return {}, {}
     rows = db.query(NGOAllocation).filter(
         NGOAllocation.ngo_id.in_(ngo_ids),
         NGOAllocation.allocation_date == target,
-        NGOAllocation.institution_id != exclude_institution_id,
         NGOAllocation.status.in_(["scheduled", "collected"])).all()
     given: dict[int, int] = {}
     busy: dict[int, list[tuple[int, int]]] = {}
@@ -259,9 +275,8 @@ def allocate(db: Session, institution_id: int, target: date,
     closing_min = (_parse_hm(institution.closing_time)
                    if institution and institution.closing_time else DEFAULT_CLOSING_MIN)
 
-    other_given, other_busy = _cross_institution_state(
-        db, [n.id for n in ngos], target, institution_id)
-    capacity = {n.id: max(0, n.daily_need_meals - other_given.get(n.id, 0)) for n in ngos}
+    given_today, busy_today = _committed_state(db, [n.id for n in ngos], target)
+    capacity = {n.id: max(0, n.daily_need_meals - given_today.get(n.id, 0)) for n in ngos}
 
     total_surplus = sum(remaining[s.id] for s in surplus)
     veg_total = sum(remaining[s.id] for s in surplus if s.is_veg)
@@ -337,7 +352,7 @@ def allocate(db: Session, institution_id: int, target: date,
     for n in ngos:
         recent = _recent_share(db, n.id, target)
         rotation = 1.0 - min(0.6, recent)          # recently over-served -> lower
-        unmet_today = 1.0 - min(1.0, other_given.get(n.id, 0) / max(1, n.daily_need_meals))
+        unmet_today = 1.0 - min(1.0, given_today.get(n.id, 0) / max(1, n.daily_need_meals))
         urgency = 0.5 + 1.5 * max(0.0, unmet_today)
         w = n.reliability_score * rotation * urgency
         weights.append(max(1, int(round(w * 100))))
@@ -439,7 +454,7 @@ def allocate(db: Session, institution_id: int, target: date,
     for idx in sorted(range(len(results)), key=lambda i: _deadline(results[i])):
         r = results[idx]
         deadline = _deadline(r)
-        busy_for_ngo = other_busy.get(r["ngo_id"], [])
+        busy_for_ngo = busy_today.get(r["ngo_id"], [])
         chosen, fallback = None, None
         for cs in candidate_starts:
             interval = (cs, cs + SLOT_LENGTH_MIN)
@@ -453,7 +468,7 @@ def allocate(db: Session, institution_id: int, target: date,
         start = chosen if chosen is not None else (fallback or candidate_starts[0])
         r["pickup_slot"] = _slot_str(start)
         r["expiry_risk"] = (start + SLOT_LENGTH_MIN) > deadline
-        other_busy.setdefault(r["ngo_id"], []).append((start, start + SLOT_LENGTH_MIN))
+        busy_today.setdefault(r["ngo_id"], []).append((start, start + SLOT_LENGTH_MIN))
 
     results.sort(key=lambda r: -r["quantity"])
     distributed_total = sum(r["quantity"] for r in results)
