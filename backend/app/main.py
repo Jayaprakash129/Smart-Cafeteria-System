@@ -1,4 +1,5 @@
 """Smart Cafeteria System - FastAPI application entry point."""
+import logging
 from datetime import date
 
 from fastapi import FastAPI
@@ -7,9 +8,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.agents.llm import is_available
 from app.config import NGO_MIN_GUARANTEE, PRICE_FLOOR_MARGIN, TRIAL_DISCOUNT
 from app.database import Base, engine
+from app.migrate import SchemaDriftError, migrate_schema
 from app.routers import admin, auth_router, customer, kitchen, ngo
 
+logger = logging.getLogger("smart_cafeteria.startup")
+
 Base.metadata.create_all(engine)
+
+# Self-heal an out-of-date database: a column added to a model after a
+# database was already seeded (e.g. Dish.reference_price,
+# NGOAllocation.expiry_risk) would otherwise surface as an opaque
+# "sqlite3.OperationalError: no such column" the first time it's queried,
+# on every dish/kitchen endpoint. See app/migrate.py for what this can and
+# cannot safely fix on its own.
+try:
+    _migration_report = migrate_schema(engine)
+    if _migration_report.drift:
+        logger.warning(_migration_report.summary())
+    else:
+        logger.info(_migration_report.summary())
+except SchemaDriftError as exc:
+    logger.error(str(exc))
+    raise
 
 app = FastAPI(
     title="Smart Cafeteria System API",

@@ -88,7 +88,23 @@ async function rawRequest(path, { method = "GET", body } = {}) {
   }
 
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  // Check res.ok and parse defensively: an unhandled backend exception (a
+  // bare 500) returns a plain-text body like "Internal Server Error", not
+  // JSON. Parsing that unconditionally used to throw "Unexpected token
+  // 'I'... is not valid JSON" -- a confusing error about the error -- instead
+  // of surfacing the actual status code and response body.
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      if (!res.ok) {
+        throw new Error(`Request failed (${res.status}): ${text.slice(0, 300)}`);
+      }
+      // A 2xx with a non-JSON body isn't expected from this API; fall
+      // through and return null rather than crashing the caller.
+    }
+  }
   if (!res.ok) {
     throw new Error(formatApiError(data, res.status));
   }
