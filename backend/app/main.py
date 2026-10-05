@@ -6,7 +6,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.agents.llm import is_available
-from app.config import NGO_MIN_GUARANTEE, PRICE_FLOOR_MARGIN, TRIAL_DISCOUNT
+from app.bootstrap import ensure_bootstrapped
+from app.config import (AUTO_BOOTSTRAP, NGO_MIN_GUARANTEE, PRICE_FLOOR_MARGIN,
+                        TRIAL_DISCOUNT)
 from app.database import Base, engine
 from app.migrate import SchemaDriftError, migrate_schema
 from app.routers import admin, auth_router, customer, kitchen, ngo
@@ -30,6 +32,12 @@ try:
 except SchemaDriftError as exc:
     logger.error(str(exc))
     raise
+
+# A fresh clone has no database or models (both gitignored), so the tables
+# above were just created empty and every demo login would 401. Seed and
+# train once; a no-op whenever data and models already exist.
+if AUTO_BOOTSTRAP:
+    ensure_bootstrapped()
 
 app = FastAPI(
     title="Smart Cafeteria System API",

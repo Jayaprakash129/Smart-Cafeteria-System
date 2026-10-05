@@ -16,11 +16,28 @@ Requires **Python 3.10+** (the models use `X | None` type-hint syntax) and
 **Node 20+**. Run both commands below from the repository root, in two
 terminals.
 
-**Terminal 1 — backend**
+**Terminal 1 — backend** (pick the line for your shell)
+
+macOS / Linux / Git Bash:
 
 ```bash
 cd backend && python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && python -m uvicorn app.main:app --reload --port 8000
 ```
+
+Windows Command Prompt (cmd):
+
+```bat
+cd backend && python -m venv .venv && .venv\Scripts\activate && pip install -r requirements.txt && python -m uvicorn app.main:app --reload --port 8000
+```
+
+Windows PowerShell:
+
+```powershell
+cd backend; python -m venv .venv; .venv\Scripts\Activate.ps1; pip install -r requirements.txt; python -m uvicorn app.main:app --reload --port 8000
+```
+
+If PowerShell blocks `Activate.ps1`, run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
 
 **Terminal 2 — frontend**
 
@@ -30,7 +47,12 @@ cd frontend && npm install && npm run dev
 
 Open **http://localhost:5173**. API docs at **http://localhost:8000/docs**.
 
-If the database is missing or you want a clean slate:
+On first start (e.g. a fresh clone — the database and trained models are
+gitignored) the backend seeds the demo dataset and trains the models
+automatically, which takes about a minute once. Wait for `Bootstrap complete`
+in the backend log before logging in. Later starts skip this step.
+
+To reset to a clean slate manually:
 
 ```bash
 cd backend && python -m app.seed && python -c "from app.engines import forecasting,waste,trial_conversion; forecasting.train(); waste.train(); trial_conversion.train()"
@@ -59,6 +81,7 @@ environment variables for anything beyond that:
 | `DATABASE_URL` | `sqlite:///backend/data/smart_cafeteria.db` | SQLAlchemy connection string (Postgres-swappable) |
 | `MODEL_DIR` | `backend/models_store` | Where trained `.joblib` models are read/written |
 | `JWT_SECRET` | a fixed demo string | **Set this in any shared or production deployment** |
+| `AUTO_BOOTSTRAP` | `true` | Seed an empty database and train missing models at startup |
 | `DEMO_MODE` | `true` | Gates `GET /api/auth/demo-accounts`, which otherwise lists every role's password unauthenticated. Set to `false` outside local demo use |
 
 ---

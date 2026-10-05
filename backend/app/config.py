@@ -26,6 +26,11 @@ JWT_EXPIRY_MINUTES = 60 * 12
 # deliberately for a local demo via DEMO_MODE=true.
 DEMO_MODE = os.environ.get("DEMO_MODE", "true").lower() in ("1", "true", "yes")
 
+# The database and trained models are gitignored, so a fresh clone starts
+# with empty tables (every login 401s). When enabled, startup seeds an empty
+# database and trains any missing model once -- see app/bootstrap.py.
+AUTO_BOOTSTRAP = os.environ.get("AUTO_BOOTSTRAP", "true").lower() in ("1", "true", "yes")
+
 # ---- Business rules from the project specification ----------------------
 # Hard cost-recovery floor: no price may ever fall below cost + 20%.
 PRICE_FLOOR_MARGIN = 0.20
