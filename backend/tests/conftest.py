@@ -18,6 +18,8 @@ _TMP_DIR = tempfile.mkdtemp(prefix="smart_cafeteria_test_")
 os.environ["DATABASE_URL"] = f"sqlite:///{os.path.join(_TMP_DIR, 'test.db')}"
 os.environ["MODEL_DIR"] = os.path.join(_TMP_DIR, "models")
 os.environ["DEMO_MODE"] = "true"
+# pytest_sessionstart seeds and trains this instance itself.
+os.environ["AUTO_BOOTSTRAP"] = "false"
 os.environ.setdefault("JWT_SECRET", "pytest-secret")
 
 from fastapi.testclient import TestClient  # noqa: E402
